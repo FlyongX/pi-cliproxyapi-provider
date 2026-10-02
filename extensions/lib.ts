@@ -589,6 +589,7 @@ export async function fetchCodexModels(
 	apiKey: string,
 	timeoutMs = MODELS_REQUEST_TIMEOUT_MS,
 	signal?: AbortSignal,
+	strictCatalog = false,
 ): Promise<CodexClientModel[]> {
 	const timeoutSignal = AbortSignal.timeout(timeoutMs);
 	const requestSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
@@ -606,27 +607,41 @@ export async function fetchCodexModels(
 		throw new ModelsHttpError(response.status, response.statusText, body);
 	}
 
-	// Status 200 is enough for success, even when the catalog is empty or non-JSON.
+	// Login retains its permissive HTTP-success validation. Only manual strict
+	// synchronization requires a parseable, recognized catalog before replacing it.
 	let payload: unknown;
 	try {
 		payload = await response.json();
-	} catch {
+	} catch (error) {
+		if (strictCatalog) throw error;
 		return [];
 	}
 
+	let models: unknown[] | undefined;
 	if (Array.isArray(payload)) {
-		return payload as CodexClientModel[];
-	}
-	if (payload && typeof payload === "object") {
+		models = payload;
+	} else if (payload && typeof payload === "object") {
 		const obj = payload as CodexClientModelsResponse;
 		if (Array.isArray(obj.models)) {
-			return obj.models;
-		}
-		if (Array.isArray(obj.data)) {
-			return obj.data;
+			models = obj.models;
+		} else if (Array.isArray(obj.data)) {
+			models = obj.data;
 		}
 	}
-	return [];
+	if (strictCatalog) {
+		requestSignal.throwIfAborted();
+		if (!models) {
+			throw new Error("Invalid models catalog: expected an array or a models/data array.");
+		}
+		for (const model of models) {
+			const entry = asRecord(model);
+			const id = entry?.slug ?? entry?.id;
+			if (typeof id !== "string" || !id.trim()) {
+				throw new Error("Invalid models catalog: every entry must have a non-empty slug or id.");
+			}
+		}
+	}
+	return (models ?? []) as CodexClientModel[];
 }
 
 export interface ResolvedModelsResult {
@@ -921,13 +936,14 @@ export async function loadMappedModels(
 	timeoutOrFastMode: number | boolean = MODELS_REQUEST_TIMEOUT_MS,
 	agentDir?: string,
 	signal?: AbortSignal,
+	strictCatalog = false,
 ): Promise<MappedModels> {
 	const pricingEnabled = typeof timeoutOrFastMode === "boolean";
 	const effectiveFastMode = typeof timeoutOrFastMode === "boolean" ? timeoutOrFastMode : false;
 	const timeoutMs = typeof timeoutOrFastMode === "number" ? timeoutOrFastMode : MODELS_REQUEST_TIMEOUT_MS;
 	const endpoints = resolveEndpoints(baseUrlInput);
 	const [remoteModels, costCatalog] = await Promise.all([
-		fetchCodexModels(endpoints.modelsUrl, apiKey, timeoutMs, signal),
+		fetchCodexModels(endpoints.modelsUrl, apiKey, timeoutMs, signal, strictCatalog),
 		pricingEnabled ? fetchModelsDevCostMap(agentDir, false, signal) : Promise.resolve(undefined),
 	]);
 	const models = remoteModels
@@ -1043,7 +1059,8 @@ export function mergeModelsWithExistingCache(
 
 /**
  * Load mapped models from the matching cache, or fetch remotely and update the cache.
- * A forced refresh always bypasses the cache.
+ * A forced refresh bypasses the cache but still retains temporarily missing models.
+ * Only strictCatalog validates and replaces the catalog without missing-model retention.
  */
 export async function resolveMappedModels(
 	agentDir: string,
@@ -1051,6 +1068,8 @@ export async function resolveMappedModels(
 	apiKey: string,
 	options: {
 		forceRefresh?: boolean;
+		/** Manual synchronization: require a valid remote catalog and remove missing models. */
+		strictCatalog?: boolean;
 		fastMode?: boolean;
 		signal?: AbortSignal;
 		shouldCommit?: () => boolean;
@@ -1061,14 +1080,30 @@ export async function resolveMappedModels(
 		options.fastMode === undefined || (cache.fastMode ?? false) === options.fastMode;
 
 	const existingCache = loadModelsCache(agentDir, baseUrlInput);
-	if (!options.forceRefresh) {
+	if (!options.forceRefresh && !options.strictCatalog) {
 		if (existingCache && cacheMatchesFastMode(existingCache)) {
 			return { loaded: existingCache, fromCache: true };
 		}
 	}
 
-	const fresh = await loadMappedModels(baseUrlInput, apiKey, options.fastMode, agentDir, options.signal);
-	const { merged } = mergeModelsWithExistingCache(existingCache, fresh, Date.now(), options.staleTtlMs);
+	const fresh = await loadMappedModels(
+		baseUrlInput,
+		apiKey,
+		options.fastMode,
+		agentDir,
+		options.signal,
+		options.strictCatalog,
+	);
+	if (options.strictCatalog) {
+		const registeredIds = new Set(fresh.models.map((model) => model.id));
+		fresh.fastModelIds = fresh.fastModelIds.filter((id) => registeredIds.has(id));
+	}
+	const { merged } = mergeModelsWithExistingCache(
+		options.strictCatalog ? null : existingCache,
+		fresh,
+		Date.now(),
+		options.staleTtlMs,
+	);
 	if (!options.signal?.aborted && (options.shouldCommit?.() ?? true)) {
 		saveModelsCache(agentDir, merged);
 	}

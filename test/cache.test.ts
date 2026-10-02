@@ -633,19 +633,19 @@ describe("provider startup cache behavior", () => {
 				await refresh.handler("", { ui: { notify } } as unknown as ExtensionCommandContext);
 
 				const diskCacheAfterNewerRefresh = loadModelsCache(agentDir, "http://127.0.0.1:8317");
-				expect(diskCacheAfterNewerRefresh?.models[0]?.id).toBe("newer");
+				expect(diskCacheAfterNewerRefresh?.models.map((model) => model.id)).toEqual(["newer"]);
 
 				releaseBackground(new Response(JSON.stringify({ models: [createCodexModel("older")] }), { status: 200 }));
 				await waitForAsyncRefresh();
 
 				const diskCacheAfterOlderRefresh = loadModelsCache(agentDir, "http://127.0.0.1:8317");
-				expect(diskCacheAfterOlderRefresh?.models[0]?.id).toBe("newer");
+				expect(diskCacheAfterOlderRefresh?.models.map((model) => model.id)).toEqual(["newer"]);
 				const callsWithModels = (
 					(pi.registerProvider as ReturnType<typeof vi.fn>).mock.calls as Array<
 						[string, { models?: PiProviderModel[] }]
 					>
 				).filter(([, config]) => config.models && config.models.length > 0);
-				expect(callsWithModels.at(-1)?.[1].models?.[0]?.id).toBe("newer");
+				expect(callsWithModels.at(-1)?.[1].models?.map((model) => model.id)).toEqual(["newer"]);
 			} finally {
 				fetchMock.mockRestore();
 			}
