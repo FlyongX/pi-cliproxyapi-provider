@@ -190,8 +190,8 @@ Startup, background refreshes, login, and other non-manual refreshes retain miss
 
 ### Refresh commands
 
-- `/cliproxyapi-refresh` — fetch and **strictly synchronize** the current CPA catalog, rewrite the CPA mapping cache, and update registered models and Fast-capable IDs. Added and reappearing models are registered; missing models and entries with `visibility: "hide"` are removed immediately, without grace. Use this after changing the proxy's available models, without restarting pi.
-- `/login CLIProxyAPI` / `/login cliproxyapi` — re-entering credentials always forces a fresh models query and rewrites the cache, but keeps the existing permissive login validation and missing-model grace.
+- `/cliproxyapi-refresh` — fetch and **strictly synchronize** the current CPA catalog, rewrite the CPA mapping cache, and update registered models and Fast-capable IDs. Added and reappearing models are registered; missing models and entries with `visibility: "hide"` are removed immediately, without grace. It also **forces a models.dev refresh**, bypassing its 24-hour cache validity. Use this after proxy catalog or reference metadata changes, without restarting pi.
+- `/login CLIProxyAPI` / `/login cliproxyapi` — re-entering credentials always forces a fresh CPA models query and rewrites its cache, but keeps the existing permissive login validation and missing-model grace. It still respects the models.dev cache's 24-hour validity, as do startup, background CPA refreshes, recovery and Fast toggles.
 
 Manual strict synchronization requires successful HTTP and a valid JSON catalog: a model array, `{ "models": [...] }`, or `{ "data": [...] }`, with a non-empty `slug` or `id` for each entry. An explicit empty array (or a catalog containing only hidden models) is a successful **zero-model** result: registration and the CPA mapping cache are cleared, including Fast IDs. The provider remains available for configuration and later refreshes; historical or built-in lists are not restored as a fallback.
 
@@ -209,20 +209,55 @@ From CPA catalog entry → pi model:
 | ----------- | ---------- |
 | `slug` | `id` |
 | `display_name` | `name` |
-| `context_window` | `contextWindow` |
+| `context_window`, then `max_context_window` | `contextWindow` fallback when reference metadata is unavailable |
 | `input_modalities` | `input` (`text` / `image`) |
-| `supported_reasoning_levels[].effort` | `thinkingLevelMap` + `reasoning` |
+| `max_tokens`, then `max_output_tokens`, then `max_completion_tokens` | `maxTokens` fallback when reference metadata is unavailable |
+| `supported_reasoning_levels[].effort` | `thinkingLevelMap` + `reasoning` fallback when reference metadata cannot correct them |
 | `visibility: "hide"` | skipped |
 
-Unsupported pi thinking levels are set to `null` so they are hidden in the UI. When available, prices are matched against canonical model entries in `models.dev`; `cost.tiers[].tier.size` becomes pi's `inputTokensAbove`, including thresholds such as `272000`. The legacy `context_over_200k` field is used only when no explicit tiers are present. Ambiguous reseller prices are not selected arbitrarily and fall back to zero. These are catalog/list prices, not a guarantee of CPA's own markup or billing.
+### Limits and reasoning metadata
 
-A small explicit alias table covers known CLIProxyAPI variants such as `gemini-pro-agent` → `gemini-3.1-pro-preview`; unknown variants are not guessed.
+For each limit independently, the priority is:
 
-### models.dev cache
+1. Your pi `models.json` **modelOverrides** (the host's final override layer).
+2. A reliably matched models.dev field: `limit.context` → `contextWindow`, `limit.output` → `maxTokens`.
+3. The valid CPA fields listed above, in their existing fallback order.
+4. Defaults: 128000 context tokens and 16384 output tokens.
 
-The raw `models.dev` response is cached at `<agentDir>/cache/cliproxyapi/models-dev.json`, where `agentDir` is resolved by the pi host (normally `~/.pi/agent`, or the directory selected by `PI_CODING_AGENT_DIR`). Different agent directories have isolated caches; sessions using the same agent directory reuse its cache. The file preserves the original `{ "timestamp": ..., "providers": ... }` format, including the full providers data, and contains no CPA credentials.
+Only finite positive numbers are accepted. A missing or invalid reference field falls back independently; a valid reference field can replace an inaccurate CPA value, even if it is larger. The plugin does not take the minimum of both sources. Metadata can come from reference entries without prices.
 
-The cache remains valid for 24 hours. A fresh cache avoids the network request; an expired cache is refreshed with a three-second timeout. Network, HTTP, or JSON failures retain usable stale data. Without usable cached data, pricing safely falls back to zero without blocking CPA discovery or login. Cache write failures are also tolerated.
+Matching prefers original providers (for example OpenAI, Anthropic, Google, DeepSeek and Alibaba/Qwen), using full IDs, explicit provider namespaces and unambiguous separator normalization. It does not strip variant suffixes or use pricing aliases to infer capabilities. Conflicting reseller limits or reasoning information remain unmatched, even if their prices are equal; unmatched CPA models remain available with their CPA/default metadata.
+
+When `reasoning_options` contains valid named `effort.values`, those declarations replace CPA thinking levels. Unsupported pi levels are set to `null`. Only an explicit `none` enables `off` → `none`; toggle, `null` and `default` do not imply it. `max`, `xhigh` and `ultra` are not aliased to each other, and a level the host cannot express is not made selectable. Explicit `reasoning: false` disables reasoning and clears CPA effort mappings. Budget-token or toggle-only controls, absent named efforts and malformed reasoning information leave CPA reasoning unchanged; they do not prevent independent limit corrections. No new budget/toggle protocol adapter is added.
+
+These are **reference model limits, not a guarantee that your proxy accepts requests of that size**. If CPA enforces smaller limits, use pi's existing escape hatch in `~/.pi/agent/models.json` (substitute your configured provider/model IDs):
+
+```json
+{
+  "providers": {
+    "cliproxyapi": {
+      "modelOverrides": {
+        "gpt-5.4": {
+          "contextWindow": 128000,
+          "maxTokens": 16384
+        }
+      }
+    }
+  }
+}
+```
+
+The plugin does not change the currently selected thinking level or add notifications/clamping when supported efforts change. The user and pi handle the selection. Input modalities, Fast capability, endpoints and non-manual missing-model grace are unchanged.
+
+### Prices and shared reference cache
+
+When available, prices are matched against canonical model entries in `models.dev`; `cost.tiers[].tier.size` becomes pi's `inputTokensAbove`, including thresholds such as `272000`. The legacy `context_over_200k` field is used only when no explicit tiers are present. Ambiguous reseller prices are not selected arbitrarily and fall back to zero. These are catalog/list prices, not a guarantee of CPA's own markup or billing.
+
+A small **pricing-only** alias table covers known CLIProxyAPI variants such as `gemini-pro-agent` → `gemini-3.1-pro-preview`; it is never reused for metadata, and unknown variants are not guessed.
+
+Prices and metadata reuse the same raw `models.dev` response; no second directory is downloaded. It is cached at `<agentDir>/cache/cliproxyapi/models-dev.json`, where `agentDir` is resolved by the pi host (normally `~/.pi/agent`, or the directory selected by `PI_CODING_AGENT_DIR`). Different agent directories have isolated caches; sessions using the same agent directory reuse its cache. The file preserves the original `{ "timestamp": ..., "providers": ... }` format, including the full providers data, and contains no CPA credentials.
+
+The cache remains valid for 24 hours. A fresh cache avoids the network request except for `/cliproxyapi-refresh`. An expired or manually forced cache is refreshed with the existing three-second timeout. Network, HTTP, or JSON failures retain usable old data, even when it was still fresh. Without usable cached data, prices fall back to zero and metadata falls back to CPA/default values, without blocking CPA discovery, refresh or login. Cache write failures are also tolerated.
 
 The old `<agentDir>/tmp/models-dev-cache.json` location is **not automatically read, copied, migrated, or deleted**. If the new location has no cache, the normal cache-miss flow runs. You may manually copy an existing cache in the same format to the new location. Standalone helper calls without an `agentDir` still use the existing system temporary file, `pi-cliproxyapi-models-dev-cache.json`; extension calls do not fall back to that shared file.
 
