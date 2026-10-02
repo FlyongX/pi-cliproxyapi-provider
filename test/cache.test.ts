@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
@@ -6,6 +6,7 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
 import { afterEach, describe, expect, it, vi } from "vitest";
 import providerExtension from "../extensions/index.ts";
 import {
+	AUTH_FILE_NAME,
 	CONFIG_FILE_NAME,
 	DEFAULT_MODEL_STALE_TTL_MS,
 	fetchCodexModels,
@@ -434,6 +435,92 @@ describe("resolveMappedModels cache behavior", () => {
 });
 
 describe("provider startup cache behavior", () => {
+	it("stores raw models.dev data under the host agentDir without moving config, auth or mapped models", async () => {
+		await withTempAgentDir(async (agentDir) => {
+			writeConfig(agentDir, { baseUrl: "http://127.0.0.1:8317", apiKey: "fixture-cpa-key" });
+			const auth = JSON.stringify({
+				cliproxyapi: {
+					type: "oauth",
+					access: "fixture-cpa-key",
+					refresh: JSON.stringify({ baseUrl: "http://127.0.0.1:8317" }),
+					expires: Date.now() + 60_000,
+				},
+			});
+			writeFileSync(join(agentDir, AUTH_FILE_NAME), auth);
+			const originalConfig = readFileSync(join(agentDir, CONFIG_FILE_NAME), "utf8");
+			const providers = {
+				openai: { models: { "gpt-5": { cost: { input: 5, output: 30 }, limit: { context: 200000 } } } },
+			};
+			const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+				if (String(input) === "https://models.dev/api.json") {
+					return new Response(JSON.stringify(providers));
+				}
+				return new Response(JSON.stringify({ models: [createCodexModel("gpt-5")] }));
+			});
+			const { pi, emit } = createPiMock();
+
+			try {
+				await providerExtension(pi);
+				expect(pi.registerProvider).toHaveBeenLastCalledWith(
+					"cliproxyapi",
+					expect.objectContaining({
+						models: [
+							expect.objectContaining({
+								id: "gpt-5",
+								cost: { input: 5, output: 30, cacheRead: 0, cacheWrite: 0 },
+							}),
+						],
+					}),
+				);
+				const rawCache = readFileSync(join(agentDir, "cache/cliproxyapi/models-dev.json"), "utf8");
+				expect(JSON.parse(rawCache)).toEqual({ timestamp: expect.any(Number), providers });
+				expect(rawCache).not.toContain("fixture-cpa-key");
+				const pricingRequest = fetchMock.mock.calls.find(
+					([input]) => String(input) === "https://models.dev/api.json",
+				);
+				expect(pricingRequest).toBeDefined();
+				expect(new Headers(pricingRequest?.[1]?.headers).has("Authorization")).toBe(false);
+				expect(readFileSync(join(agentDir, CONFIG_FILE_NAME), "utf8")).toBe(originalConfig);
+				expect(readFileSync(join(agentDir, AUTH_FILE_NAME), "utf8")).toBe(auth);
+				expect(loadModelsCache(agentDir, "http://127.0.0.1:8317")?.models[0]?.cost.input).toBe(5);
+				expect(existsSync(join(agentDir, "tmp/models-dev-cache.json"))).toBe(false);
+			} finally {
+				await emit("session_shutdown");
+				fetchMock.mockRestore();
+			}
+		});
+	});
+
+	it("reads fresh raw models.dev data from the host agentDir without fetching it", async () => {
+		await withTempAgentDir(async (agentDir) => {
+			writeConfig(agentDir, { baseUrl: "http://127.0.0.1:8317", apiKey: "fixture-cpa-key" });
+			mkdirSync(join(agentDir, "cache/cliproxyapi"), { recursive: true });
+			writeFileSync(
+				join(agentDir, "cache/cliproxyapi/models-dev.json"),
+				JSON.stringify({
+					timestamp: Date.now(),
+					providers: { openai: { models: { "gpt-5": { cost: { input: 5, output: 30 } } } } },
+				}),
+			);
+			const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+				if (String(input) === "https://models.dev/api.json") throw new Error("Unexpected models.dev request");
+				return new Response(JSON.stringify({ models: [createCodexModel("gpt-5")] }));
+			});
+			const { pi, emit } = createPiMock();
+
+			try {
+				await providerExtension(pi);
+				expect(loadModelsCache(agentDir, "http://127.0.0.1:8317")?.models[0]?.cost.input).toBe(5);
+				expect(fetchMock.mock.calls.map(([input]) => String(input))).toEqual([
+					"http://127.0.0.1:8317/v1/models?client_version=pi",
+				]);
+			} finally {
+				await emit("session_shutdown");
+				fetchMock.mockRestore();
+			}
+		});
+	});
+
 	it("waits for the remote catalog when no cache exists", async () => {
 		await withTempAgentDir(async (agentDir) => {
 			writeConfig(agentDir, { baseUrl: "http://127.0.0.1:8317", apiKey: "key" });
@@ -1070,6 +1157,62 @@ describe("provider startup cache behavior", () => {
 			} finally {
 				delete process.env.CLIPROXYAPI_FAST;
 				vi.useRealTimers();
+				fetchMock.mockRestore();
+			}
+		});
+	});
+});
+
+describe.each(["offline", "unwritable"] as const)("models.dev %s resilience", (failure) => {
+	it.each(["startup", "login"] as const)("keeps CPA %s working", async (flow) => {
+		await withTempAgentDir(async (agentDir) => {
+			if (flow === "startup") {
+				writeConfig(agentDir, { baseUrl: "http://127.0.0.1:8317", apiKey: "fixture-cpa-key" });
+			}
+			if (failure === "unwritable") writeFileSync(join(agentDir, "cache"), "Not a directory");
+			const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+				if (String(input) === "https://models.dev/api.json") {
+					if (failure === "offline") throw new Error("models.dev is offline");
+					return new Response(
+						JSON.stringify({
+							openai: { models: { "gpt-5": { cost: { input: 5, output: 30 } } } },
+						}),
+					);
+				}
+				return new Response(JSON.stringify({ models: [createCodexModel("gpt-5")] }));
+			});
+			const { pi, emit } = createPiMock();
+
+			try {
+				await expect(providerExtension(pi)).resolves.toBeUndefined();
+				if (flow === "login") {
+					const registration = (pi.registerProvider as ReturnType<typeof vi.fn>).mock.calls.find(
+						([id]) => id === "cliproxyapi",
+					);
+					const onPrompt = vi
+						.fn()
+						.mockResolvedValueOnce("http://127.0.0.1:8317")
+						.mockResolvedValueOnce("fixture-cpa-key")
+						.mockRejectedValue(new Error("Unexpected login retry"));
+					await expect(
+						registration?.[1].oauth.login({ onPrompt, onAuth: vi.fn(), onProgress: vi.fn() }),
+					).resolves.toMatchObject({ access: "fixture-cpa-key" });
+				}
+				expect(pi.registerProvider).toHaveBeenLastCalledWith(
+					"cliproxyapi",
+					expect.objectContaining({
+						models: [expect.objectContaining({ id: "gpt-5" })],
+					}),
+				);
+				expect(loadModelsCache(agentDir, "http://127.0.0.1:8317")?.models[0]?.cost.input).toBe(
+					failure === "offline" ? 0 : 5,
+				);
+				expect(JSON.parse(readFileSync(join(agentDir, CONFIG_FILE_NAME), "utf8"))).toMatchObject({
+					apiKey: "fixture-cpa-key",
+				});
+				expect(existsSync(join(agentDir, "cache/cliproxyapi/models-dev.json"))).toBe(false);
+			} finally {
+				await emit("session_shutdown");
 				fetchMock.mockRestore();
 			}
 		});
