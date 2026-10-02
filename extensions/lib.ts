@@ -144,6 +144,9 @@ interface ModelsDevModePayload {
 }
 
 interface ModelsDevModelPayload {
+	limit?: unknown;
+	reasoning?: unknown;
+	reasoning_options?: unknown;
 	cost?: ModelsDevCostPayload;
 	experimental?: {
 		modes?: Record<string, ModelsDevModePayload | undefined>;
@@ -157,9 +160,25 @@ export interface ModelsDevCostEntry {
 	fast?: PiProviderCost;
 }
 
+interface ModelsDevMetadataEntry {
+	providerId: string;
+	modelId: string;
+	contextWindow?: number;
+	maxTokens?: number;
+	reasoning?: boolean;
+	efforts?: string[];
+}
+
+interface ModelsDevMetadataCatalog {
+	exact: Map<string, ModelsDevMetadataEntry[]>;
+	normalized: Map<string, ModelsDevMetadataEntry[]>;
+}
+
 export interface ModelsDevCostCatalog {
 	exact: Map<string, ModelsDevCostEntry[]>;
 	normalized: Map<string, ModelsDevCostEntry[]>;
+	/** Independent of price availability and price aliases; shares the raw directory. */
+	metadata?: ModelsDevMetadataCatalog;
 }
 
 export interface OAuthRefreshMeta {
@@ -526,13 +545,21 @@ export function toPiModel(
 		return null;
 	}
 
-	const efforts = extractReasoningEfforts(model);
-	const hasReasoning = efforts.some((effort) => effort !== "none");
+	const reference = costCatalog?.metadata ? findModelMetadata(id, costCatalog.metadata) : undefined;
+	const efforts = reference?.efforts ?? extractReasoningEfforts(model);
+	const hasReasoning = reference?.reasoning !== false && efforts.some((effort) => effort !== "none");
+	const thinkingLevelMap: ThinkingLevelMap | undefined =
+		reference?.reasoning === false
+			? Object.fromEntries(PI_THINKING_LEVELS.map((level) => [level, null]))
+			: buildThinkingLevelMap(efforts);
+	if (reference?.efforts && thinkingLevelMap) {
+		// Not a host-selectable level; do not alias it to max or xhigh.
+		thinkingLevelMap.ultra = null;
+	}
 	const contextWindow =
-		(typeof model.context_window === "number" && model.context_window > 0 ? model.context_window : undefined) ??
-		(typeof model.max_context_window === "number" && model.max_context_window > 0
-			? model.max_context_window
-			: undefined) ??
+		reference?.contextWindow ??
+		positiveFiniteNumber(model.context_window) ??
+		positiveFiniteNumber(model.max_context_window) ??
 		DEFAULT_CONTEXT_WINDOW;
 
 	const cost = costCatalog
@@ -540,19 +567,10 @@ export function toPiModel(
 		: { ...ZERO_COST };
 
 	const maxTokens =
-		(typeof model.max_tokens === "number" && Number.isFinite(model.max_tokens) && model.max_tokens > 0
-			? model.max_tokens
-			: undefined) ??
-		(typeof model.max_output_tokens === "number" &&
-		Number.isFinite(model.max_output_tokens) &&
-		model.max_output_tokens > 0
-			? model.max_output_tokens
-			: undefined) ??
-		(typeof model.max_completion_tokens === "number" &&
-		Number.isFinite(model.max_completion_tokens) &&
-		model.max_completion_tokens > 0
-			? model.max_completion_tokens
-			: undefined) ??
+		reference?.maxTokens ??
+		positiveFiniteNumber(model.max_tokens) ??
+		positiveFiniteNumber(model.max_output_tokens) ??
+		positiveFiniteNumber(model.max_completion_tokens) ??
 		DEFAULT_MAX_TOKENS;
 
 	return {
@@ -563,7 +581,7 @@ export function toPiModel(
 		cost,
 		contextWindow,
 		maxTokens,
-		thinkingLevelMap: buildThinkingLevelMap(efforts),
+		thinkingLevelMap,
 	};
 }
 
@@ -666,6 +684,11 @@ const MODEL_PROVIDER_PREFERENCES: Array<{ pattern: RegExp; providers: string[] }
 	{ pattern: /^llama-/, providers: ["meta"] },
 ];
 
+// Metadata deliberately has its own identity rules, not the pricing aliases or
+// pricing's punctuation-erasing normalization. Qwen's original provider is Alibaba.
+const MODEL_METADATA_NAMESPACE =
+	/^(openai|anthropic|google(?:-vertex)?|xai|deepseek|mistral|cohere|zhipuai|moonshotai|minimax|meta|alibaba|qwen)[/:.]/i;
+
 /** Explicit aliases for proxy-specific model ids whose billable base model is known. */
 const MODEL_PRICE_ALIASES: Record<string, string[]> = {
 	"gemini-pro-agent": ["gemini-3.1-pro-preview"],
@@ -682,6 +705,11 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 
 function finiteNumber(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function positiveFiniteNumber(value: unknown): number | undefined {
+	const number = finiteNumber(value);
+	return number !== undefined && number > 0 ? number : undefined;
 }
 
 function readCostRate(
@@ -768,7 +796,11 @@ function preferredProvidersForModel(modelId: string): string[] {
 	return uniqueStrings([namespace ?? "", ...familyProviders]);
 }
 
-function addCatalogEntry(catalog: Map<string, ModelsDevCostEntry[]>, key: string, entry: ModelsDevCostEntry): void {
+function addCatalogEntry<T extends { providerId: string; modelId: string }>(
+	catalog: Map<string, T[]>,
+	key: string,
+	entry: T,
+): void {
 	if (!key) return;
 	const entries = catalog.get(key) ?? [];
 	if (!entries.some((candidate) => candidate.providerId === entry.providerId && candidate.modelId === entry.modelId)) {
@@ -825,6 +857,78 @@ function findModelsDevEntry(modelId: string, catalog: ModelsDevCostCatalog): Mod
 	return undefined;
 }
 
+function metadataNamespace(modelId: string): string | undefined {
+	const namespace = modelId.trim().toLowerCase().match(MODEL_METADATA_NAMESPACE)?.[1];
+	return namespace === "qwen" ? "alibaba" : namespace === "google-vertex" ? "google" : namespace;
+}
+
+function metadataModelId(modelId: string): string {
+	return modelId.trim().toLowerCase().replace(MODEL_METADATA_NAMESPACE, "");
+}
+
+function metadataModelKey(modelId: string): string {
+	// Preserve token boundaries: gpt-5.4 and gpt-54 are not the same model.
+	return metadataModelId(modelId).replace(/[._\s]+/g, "-");
+}
+
+function metadataOriginalProvider(modelId: string): string | undefined {
+	return (
+		metadataNamespace(modelId) ??
+		(/^qwen/.test(metadataModelId(modelId)) ? "alibaba" : preferredProvidersForModel(modelId)[0])
+	);
+}
+
+function parseModelsDevEfforts(raw: unknown): string[] | undefined {
+	if (!Array.isArray(raw)) return undefined;
+	const values = new Set<unknown>();
+	for (const option of raw) {
+		const source = asRecord(option);
+		if (source?.type === "effort" && Array.isArray(source.values)) {
+			for (const value of source.values) values.add(value);
+		}
+	}
+	// Ignore default/null and malformed values. They do not declare named efforts.
+	const efforts = ["none", ...PI_THINKING_LEVELS.filter((level) => level !== "off")].filter((value) =>
+		values.has(value),
+	);
+	return efforts.length > 0 ? efforts : undefined;
+}
+
+function selectMetadataEntry(
+	entries: ModelsDevMetadataEntry[],
+	normalizedMatch: boolean,
+): ModelsDevMetadataEntry | undefined {
+	if (entries.length === 0) return undefined;
+	if (normalizedMatch && new Set(entries.map((entry) => metadataModelId(entry.modelId))).size > 1) return undefined;
+	const fingerprints = new Set(
+		entries.map((entry) => JSON.stringify([entry.contextWindow, entry.maxTokens, entry.reasoning, entry.efforts])),
+	);
+	// Equal prices do not resolve conflicting limits or reasoning capabilities.
+	return fingerprints.size === 1 ? entries[0] : undefined;
+}
+
+function findModelMetadata(modelId: string, catalog: ModelsDevMetadataCatalog): ModelsDevMetadataEntry | undefined {
+	const originalProvider = metadataOriginalProvider(modelId);
+	const originalProviders = new Set([...MODEL_PROVIDER_PREFERENCES.map(({ providers }) => providers[0]), "alibaba"]);
+	const compatible = (entry: ModelsDevMetadataEntry): boolean => {
+		if (!originalProvider) return true;
+		const namespace = metadataNamespace(entry.modelId);
+		return (
+			(!namespace || namespace === originalProvider) &&
+			(!originalProviders.has(entry.providerId) || entry.providerId === originalProvider)
+		);
+	};
+	const exact = Array.from(
+		new Set([modelId.trim().toLowerCase(), metadataModelId(modelId)].flatMap((key) => catalog.exact.get(key) ?? [])),
+	).filter(compatible);
+	const normalized = (catalog.normalized.get(metadataModelKey(modelId)) ?? []).filter(compatible);
+	const originalExact = exact.filter((entry) => entry.providerId === originalProvider);
+	const originalNormalized = normalized.filter((entry) => entry.providerId === originalProvider);
+	if (originalExact.length > 0) return selectMetadataEntry(originalExact, false);
+	if (originalNormalized.length > 0) return selectMetadataEntry(originalNormalized, true);
+	return exact.length > 0 ? selectMetadataEntry(exact, false) : selectMetadataEntry(normalized, true);
+}
+
 interface ModelsDevCacheFile {
 	timestamp: number;
 	providers: Record<string, unknown>;
@@ -871,13 +975,27 @@ function isModelsDevProviders(value: Record<string, unknown>): boolean {
 }
 
 function buildCatalogFromProviders(providers: Record<string, unknown>): ModelsDevCostCatalog {
-	const catalog: ModelsDevCostCatalog = { exact: new Map(), normalized: new Map() };
+	const metadata: ModelsDevMetadataCatalog = { exact: new Map(), normalized: new Map() };
+	const catalog: ModelsDevCostCatalog = { exact: new Map(), normalized: new Map(), metadata };
 	for (const [providerId, providerValue] of Object.entries(providers)) {
 		const provider = asRecord(providerValue);
 		const models = asRecord(provider?.models);
 		if (!models) continue;
 		for (const [modelId, modelValue] of Object.entries(models)) {
 			const model = asRecord(modelValue) as ModelsDevModelPayload | undefined;
+			const limit = asRecord(model?.limit);
+			const reference: ModelsDevMetadataEntry = {
+				providerId,
+				modelId,
+				contextWindow: positiveFiniteNumber(limit?.context),
+				maxTokens: positiveFiniteNumber(limit?.output),
+				reasoning: typeof model?.reasoning === "boolean" ? model.reasoning : undefined,
+				efforts: parseModelsDevEfforts(model?.reasoning_options),
+			};
+			for (const key of uniqueStrings([modelId.trim().toLowerCase(), metadataModelId(modelId)])) {
+				addCatalogEntry(metadata.exact, key, reference);
+			}
+			addCatalogEntry(metadata.normalized, metadataModelKey(modelId), reference);
 			const standard = parseModelsDevCost(model?.cost);
 			if (!standard) continue;
 			const fast = parseModelsDevCost(model?.experimental?.modes?.fast?.cost);
@@ -937,14 +1055,15 @@ export async function loadMappedModels(
 	agentDir?: string,
 	signal?: AbortSignal,
 	strictCatalog = false,
+	forceModelsDevRefresh = false,
 ): Promise<MappedModels> {
-	const pricingEnabled = typeof timeoutOrFastMode === "boolean";
+	const referenceEnabled = typeof timeoutOrFastMode === "boolean" || forceModelsDevRefresh;
 	const effectiveFastMode = typeof timeoutOrFastMode === "boolean" ? timeoutOrFastMode : false;
 	const timeoutMs = typeof timeoutOrFastMode === "number" ? timeoutOrFastMode : MODELS_REQUEST_TIMEOUT_MS;
 	const endpoints = resolveEndpoints(baseUrlInput);
 	const [remoteModels, costCatalog] = await Promise.all([
 		fetchCodexModels(endpoints.modelsUrl, apiKey, timeoutMs, signal, strictCatalog),
-		pricingEnabled ? fetchModelsDevCostMap(agentDir, false, signal) : Promise.resolve(undefined),
+		referenceEnabled ? fetchModelsDevCostMap(agentDir, forceModelsDevRefresh, signal) : Promise.resolve(undefined),
 	]);
 	const models = remoteModels
 		.map((model) => toPiModel(model, costCatalog, effectiveFastMode))
@@ -964,7 +1083,7 @@ export async function loadMappedModels(
 		fastModelIds,
 		inferenceBaseUrl: endpoints.inferenceBaseUrl,
 		modelsUrl: endpoints.modelsUrl,
-		...(pricingEnabled ? { fastMode: effectiveFastMode } : {}),
+		...(referenceEnabled ? { fastMode: effectiveFastMode } : {}),
 	};
 }
 
@@ -1059,8 +1178,9 @@ export function mergeModelsWithExistingCache(
 
 /**
  * Load mapped models from the matching cache, or fetch remotely and update the cache.
- * A forced refresh bypasses the cache but still retains temporarily missing models.
+ * forceRefresh bypasses the CPA cache only, retaining temporarily missing models.
  * Only strictCatalog validates and replaces the catalog without missing-model retention.
+ * Reference-directory refresh is independent.
  */
 export async function resolveMappedModels(
 	agentDir: string,
@@ -1070,6 +1190,7 @@ export async function resolveMappedModels(
 		forceRefresh?: boolean;
 		/** Manual synchronization: require a valid remote catalog and remove missing models. */
 		strictCatalog?: boolean;
+		forceModelsDevRefresh?: boolean;
 		fastMode?: boolean;
 		signal?: AbortSignal;
 		shouldCommit?: () => boolean;
@@ -1080,7 +1201,7 @@ export async function resolveMappedModels(
 		options.fastMode === undefined || (cache.fastMode ?? false) === options.fastMode;
 
 	const existingCache = loadModelsCache(agentDir, baseUrlInput);
-	if (!options.forceRefresh && !options.strictCatalog) {
+	if (!options.forceRefresh && !options.strictCatalog && !options.forceModelsDevRefresh) {
 		if (existingCache && cacheMatchesFastMode(existingCache)) {
 			return { loaded: existingCache, fromCache: true };
 		}
@@ -1093,6 +1214,7 @@ export async function resolveMappedModels(
 		agentDir,
 		options.signal,
 		options.strictCatalog,
+		options.forceModelsDevRefresh,
 	);
 	if (options.strictCatalog) {
 		const registeredIds = new Set(fresh.models.map((model) => model.id));

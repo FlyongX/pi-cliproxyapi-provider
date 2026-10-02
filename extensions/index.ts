@@ -697,7 +697,7 @@ export function registerRefreshCommand(options: {
 	} = options;
 
 	pi.registerCommand("cliproxyapi-refresh", {
-		description: "Strictly refresh CLIProxyAPI models from the remote catalog.",
+		description: "Strictly synchronize CLIProxyAPI models and force refresh models.dev reference metadata.",
 		handler: async (args, ctx) => {
 			if (args.trim()) {
 				ctx.ui.notify("Usage: /cliproxyapi-refresh", "error");
@@ -723,6 +723,7 @@ export function registerRefreshCommand(options: {
 					const { loaded } = await resolveMappedModels(agentDir, connection.baseUrlInput, connection.apiKey, {
 						forceRefresh: true,
 						strictCatalog: true,
+						forceModelsDevRefresh: true,
 						fastMode: fastMode.isEnabled(),
 						signal: refresh?.signal,
 						shouldCommit: refresh ? () => refreshCoordinator?.isCurrent(refresh.generation) ?? true : undefined,
@@ -1002,7 +1003,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	const connection = resolveConnection(agentDir, identity.providerId);
 	const registerConfiguredProvider = async (
 		currentConnection: { baseUrlInput: string; apiKey: string },
-		options: { forceRefresh?: boolean; strictCatalog?: boolean } = {},
+		options: { forceRefresh?: boolean; strictCatalog?: boolean; forceModelsDevRefresh?: boolean } = {},
 	): Promise<RefreshResult | undefined> => {
 		const refresh = modelRefreshCoordinator.begin();
 		try {
@@ -1013,6 +1014,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				{
 					forceRefresh: options.forceRefresh,
 					strictCatalog: options.strictCatalog,
+					forceModelsDevRefresh: options.forceModelsDevRefresh,
 					fastMode: fastMode.isEnabled(),
 					signal: refresh.signal,
 					shouldCommit: () => modelRefreshCoordinator.isCurrent(refresh.generation),
@@ -1105,7 +1107,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		fastMode,
 		refreshCoordinator: modelRefreshCoordinator,
 		onRefresh: (currentConnection) =>
-			registerConfiguredProvider(currentConnection, { forceRefresh: true, strictCatalog: true }),
+			registerConfiguredProvider(currentConnection, {
+				forceRefresh: true,
+				strictCatalog: true,
+				forceModelsDevRefresh: true,
+			}),
 	});
 
 	if (!connection) {
