@@ -817,7 +817,7 @@ interface ModelsDevCacheFile {
 
 function getModelsDevCachePath(agentDir?: string): string {
 	if (agentDir?.trim()) {
-		return join(agentDir, "tmp", "models-dev-cache.json");
+		return join(agentDir, "cache", "cliproxyapi", "models-dev.json");
 	}
 	return join(tmpdir(), "pi-cliproxyapi-models-dev-cache.json");
 }

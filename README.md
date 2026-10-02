@@ -210,7 +210,17 @@ From CPA catalog entry → pi model:
 
 Unsupported pi thinking levels are set to `null` so they are hidden in the UI. When available, prices are matched against canonical model entries in `models.dev`; `cost.tiers[].tier.size` becomes pi's `inputTokensAbove`, including thresholds such as `272000`. The legacy `context_over_200k` field is used only when no explicit tiers are present. Ambiguous reseller prices are not selected arbitrarily and fall back to zero. These are catalog/list prices, not a guarantee of CPA's own markup or billing.
 
-The raw `models.dev` response is cached for 24 hours at `~/.pi/agent/tmp/models-dev-cache.json`. A fresh cache avoids the network request; an expired cache is refreshed with a three-second timeout, and stale data is retained if refresh fails. If neither the network nor a previous cache is available, pricing safely falls back to zero. A small explicit alias table covers known CLIProxyAPI variants such as `gemini-pro-agent` → `gemini-3.1-pro-preview`; unknown variants are not guessed.
+A small explicit alias table covers known CLIProxyAPI variants such as `gemini-pro-agent` → `gemini-3.1-pro-preview`; unknown variants are not guessed.
+
+### models.dev cache
+
+The raw `models.dev` response is cached at `<agentDir>/cache/cliproxyapi/models-dev.json`, where `agentDir` is resolved by the pi host (normally `~/.pi/agent`, or the directory selected by `PI_CODING_AGENT_DIR`). Different agent directories have isolated caches; sessions using the same agent directory reuse its cache. The file preserves the original `{ "timestamp": ..., "providers": ... }` format, including the full providers data, and contains no CPA credentials.
+
+The cache remains valid for 24 hours. A fresh cache avoids the network request; an expired cache is refreshed with a three-second timeout. Network, HTTP, or JSON failures retain usable stale data. Without usable cached data, pricing safely falls back to zero without blocking CPA discovery or login. Cache write failures are also tolerated.
+
+The old `<agentDir>/tmp/models-dev-cache.json` location is **not automatically read, copied, migrated, or deleted**. If the new location has no cache, the normal cache-miss flow runs. You may manually copy an existing cache in the same format to the new location. Standalone helper calls without an `agentDir` still use the existing system temporary file, `pi-cliproxyapi-models-dev-cache.json`; extension calls do not fall back to that shared file.
+
+To clear the raw models.dev cache, delete `<agentDir>/cache/cliproxyapi/models-dev.json` (normally `~/.pi/agent/cache/cliproxyapi/models-dev.json`). The next models.dev lookup fetches it again. This does not move or clear `cliproxyapi.json`, `auth.json`, or the separate CPA mapped-model cache, `cliproxyapi-models.json`.
 
 ## Migration from static models.json
 
