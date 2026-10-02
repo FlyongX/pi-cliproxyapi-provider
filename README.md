@@ -10,7 +10,7 @@ Pi provider extension that discovers models from [CLIProxyAPI](https://github.co
 4. Maps the CLIProxyAPI catalog into pi models, including Fast service-tier capability.
 5. Registers inference against `{root}/backend-api/`.
 6. Provides `/fast` to toggle OpenAI priority processing for supported models.
-7. Caches the model catalog in `~/.pi/agent/cliproxyapi-models.json`, refreshes it in the background on startup, and provides `/cliproxyapi-refresh` to force a refresh.
+7. Caches the model catalog in `~/.pi/agent/cliproxyapi-models.json`, refreshes it in the background on startup with missing-model grace, and provides `/cliproxyapi-refresh` for strict catalog synchronization.
 8. In interactive TUI sessions, shows footer elapsed time during runs and a TPS / token usage toast when the agent settles.
 9. After compaction, closes the reused Codex WebSocket for that session so CLIProxyAPI's server-side context resets with the compacted client messages.
 
@@ -186,12 +186,18 @@ When the provider loads (including session resume):
 1. If a cache exists for the configured `baseUrl`, its models are registered immediately. A remote query to `{root}/v1/models?client_version=pi` then runs in the background; on success, the cache is rewritten and the registered model list is refreshed. If the query fails, the existing cache remains active.
 2. If no matching cache exists, the remote query runs synchronously. On success, the cache is written and the fetched models are registered. If it fails, startup logs a warning and no models are registered until the proxy responds.
 
-Use `/cliproxyapi-refresh` to force an immediate remote refresh of the model catalog.
+Startup, background refreshes, login, and other non-manual refreshes retain missing cached models as `stale` for a seven-day grace window starting when they first disappear. This tolerates temporary upstream capacity pruning; reappearing models become fresh again. Existing stale-model recovery retries remain in place. Forcing a remote query alone does not disable this grace window.
 
 ### Refresh commands
 
-- `/cliproxyapi-refresh` — force an immediate remote refresh of the model catalog, rewrite the cache, and update registered models. Use this after adding or removing models on the proxy without restarting pi.
-- `/login CLIProxyAPI` / `/login cliproxyapi` — re-entering credentials always forces a fresh models query and rewrites the cache.
+- `/cliproxyapi-refresh` — fetch and **strictly synchronize** the current CPA catalog, rewrite the CPA mapping cache, and update registered models and Fast-capable IDs. Added and reappearing models are registered; missing models and entries with `visibility: "hide"` are removed immediately, without grace. Use this after changing the proxy's available models, without restarting pi.
+- `/login CLIProxyAPI` / `/login cliproxyapi` — re-entering credentials always forces a fresh models query and rewrites the cache, but keeps the existing permissive login validation and missing-model grace.
+
+Manual strict synchronization requires successful HTTP and a valid JSON catalog: a model array, `{ "models": [...] }`, or `{ "data": [...] }`, with a non-empty `slug` or `id` for each entry. An explicit empty array (or a catalog containing only hidden models) is a successful **zero-model** result: registration and the CPA mapping cache are cleared, including Fast IDs. The provider remains available for configuration and later refreshes; historical or built-in lists are not restored as a fallback.
+
+Network/HTTP errors, cancellation/timeouts, non-JSON bodies, and unknown or malformed catalog structures are **failures**, not empty catalogs. The manual command reports an error and leaves the previous CPA registration and mapping cache unchanged. Older or cancelled refresh results cannot overwrite a newer catalog.
+
+There is no periodic full-catalog polling or automatic synchronization of subsequent proxy changes. Use the existing manual command for deterministic synchronization; startup refresh and stale-model recovery are not a replacement for it. A published model is not a guarantee that every inference request will succeed. Removing the currently selected model does not automatically switch models, interrupt an in-flight request, or delete session history; selection is left to you and pi.
 
 Delete `~/.pi/agent/cliproxyapi-models.json` to clear the cache manually.
 

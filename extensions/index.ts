@@ -541,7 +541,8 @@ function registerProvider(
 		// (config file / env). Never pass both for /login flows.
 		oauth,
 		...(apiKey ? { apiKey } : {}),
-		...(models && models.length > 0 ? { models } : {}),
+		// An explicit empty catalog must replace models, not restore defaults.
+		...(models !== undefined ? { models } : {}),
 	});
 }
 
@@ -696,7 +697,7 @@ export function registerRefreshCommand(options: {
 	} = options;
 
 	pi.registerCommand("cliproxyapi-refresh", {
-		description: "Force refresh CLIProxyAPI models from the remote catalog.",
+		description: "Strictly refresh CLIProxyAPI models from the remote catalog.",
 		handler: async (args, ctx) => {
 			if (args.trim()) {
 				ctx.ui.notify("Usage: /cliproxyapi-refresh", "error");
@@ -721,6 +722,7 @@ export function registerRefreshCommand(options: {
 					const refresh = refreshCoordinator?.begin();
 					const { loaded } = await resolveMappedModels(agentDir, connection.baseUrlInput, connection.apiKey, {
 						forceRefresh: true,
+						strictCatalog: true,
 						fastMode: fastMode.isEnabled(),
 						signal: refresh?.signal,
 						shouldCommit: refresh ? () => refreshCoordinator?.isCurrent(refresh.generation) ?? true : undefined,
@@ -1000,7 +1002,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	const connection = resolveConnection(agentDir, identity.providerId);
 	const registerConfiguredProvider = async (
 		currentConnection: { baseUrlInput: string; apiKey: string },
-		options: { forceRefresh?: boolean } = {},
+		options: { forceRefresh?: boolean; strictCatalog?: boolean } = {},
 	): Promise<RefreshResult | undefined> => {
 		const refresh = modelRefreshCoordinator.begin();
 		try {
@@ -1010,6 +1012,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				currentConnection.apiKey,
 				{
 					forceRefresh: options.forceRefresh,
+					strictCatalog: options.strictCatalog,
 					fastMode: fastMode.isEnabled(),
 					signal: refresh.signal,
 					shouldCommit: () => modelRefreshCoordinator.isCurrent(refresh.generation),
@@ -1101,7 +1104,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		streamSimple,
 		fastMode,
 		refreshCoordinator: modelRefreshCoordinator,
-		onRefresh: (currentConnection) => registerConfiguredProvider(currentConnection, { forceRefresh: true }),
+		onRefresh: (currentConnection) =>
+			registerConfiguredProvider(currentConnection, { forceRefresh: true, strictCatalog: true }),
 	});
 
 	if (!connection) {
